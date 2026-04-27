@@ -364,6 +364,9 @@ class PackerApp:
         except py1packer.PackerError as exc:
             logging.error("%s", exc)
             self.events.put(("done", False, None))
+        except SystemExit as exc:
+            logging.error("Operation stopped unexpectedly: %s", exc)
+            self.events.put(("done", False, None))
         except Exception:
             logging.exception("Unexpected failure")
             self.events.put(("done", False, None))

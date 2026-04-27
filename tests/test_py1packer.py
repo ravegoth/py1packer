@@ -5,8 +5,10 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import py1packer
+import py1packer_gui
 
 
 class Py1PackerTests(unittest.TestCase):
@@ -77,6 +79,37 @@ class Py1PackerTests(unittest.TestCase):
 
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual((Path(tmp) / "nested" / "payload.txt").read_text(encoding="utf-8"), "payload")
+
+    def test_build_extractor_write_failure_raises_packer_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(py1packer.PackerError):
+                py1packer.build_extractor({}, [], tmp)
+
+    def test_gui_worker_reports_system_exit_as_failure(self):
+        app = object.__new__(py1packer_gui.PackerApp)
+        app.events = py1packer_gui.queue.Queue()
+        job = {
+            "root": "unused",
+            "output": "unused",
+            "overwrite": "increment",
+            "recursive": True,
+            "exclude": [],
+            "delete_packer": False,
+            "dry_run": False,
+        }
+
+        with (
+            mock.patch("py1packer_gui.py1packer.pack_directory", side_effect=SystemExit(1)),
+            mock.patch("py1packer_gui.logging.info"),
+            mock.patch("py1packer_gui.logging.error") as log_error,
+        ):
+            py1packer_gui.PackerApp.run_job(app, job)
+
+        events = []
+        while not app.events.empty():
+            events.append(app.events.get_nowait())
+        self.assertIn(("done", False, None), events)
+        log_error.assert_called_once()
 
 
 if __name__ == "__main__":

@@ -182,8 +182,7 @@ def build_extractor(data_map, directories_to_create, output):
         except OSError as exc:
             logging.warning("could not set executable permission on %s: %s", output, exc)
     except OSError as exc:
-        logging.error("could not write to output file %s: %s", output, exc)
-        sys.exit(1)
+        raise PackerError(f"could not write to output file {output}: {exc}") from exc
 
 
 def delete_originals_packer(root, files_to_delete, dirs_to_delete):
