@@ -1,372 +1,420 @@
 #!/usr/bin/env python3
-"""
-Py1Packer GUI: A graphical interface for packing files into a self-extracting Python script.
-
-This script provides a user-friendly GUI built with Tkinter to access the functionalities
-of the py1packer tool. It allows users to select directories, set packing options,
-and view real-time logs of the process.
-"""
-
-import argparse
-import base64
 import logging
 import os
-import sys
-import shutil
-import threading
 import queue
-from itertools import count
-
+import threading
 import tkinter as tk
-from tkinter import ttk, filedialog, messagebox, scrolledtext
+from pathlib import Path
+from tkinter import filedialog, messagebox, scrolledtext, ttk
 
-class PackerLogic:
-    """
-    Encapsulates the core file processing logic of py1packer.
-    This class is designed to be called from the GUI thread.
-    """
+import py1packer
 
-    def find_output_path(self, base, policy, logger):
-        if not os.path.exists(base):
-            return base
-        if policy == 'skip':
-            logger.error(f"Output exists and policy=skip: {base}")
-            return None
-        if policy == 'increment':
-            name, ext = os.path.splitext(base)
-            for i in count(2):
-                candidate = f"{name}_{i}{ext}"
-                if not os.path.exists(candidate):
-                    return candidate
-        logger.error(f"Unknown overwrite policy: {policy}")
-        return None
-
-    def gather_files(self, root_dir, exclude, recursive, logger):
-        patterns = set(exclude or [])
-        collected_files = []
-        collected_dirs = set()
-        for dirpath, dirs, files in os.walk(root_dir, topdown=True):
-            dirs_to_process = []
-            for d in dirs:
-                rel_dir = os.path.relpath(os.path.join(dirpath, d), root_dir)
-                if any(rel_dir == p or rel_dir.startswith(p + os.sep) for p in patterns):
-                    logger.debug(f"Excluded directory {rel_dir}")
-                else:
-                    dirs_to_process.append(d)
-                    if rel_dir != '.':
-                        collected_dirs.add(rel_dir)
-            dirs[:] = dirs_to_process
-            for fname in files:
-                full = os.path.join(dirpath, fname)
-                rel = os.path.relpath(full, root_dir)
-                if any(rel == p or rel.startswith(p + os.sep) or os.path.dirname(rel).startswith(p + os.sep) for p in patterns):
-                    logger.debug(f"Excluded file {rel}")
-                    continue
-                collected_files.append(rel)
-                parent_dir = os.path.dirname(rel)
-                if parent_dir and parent_dir != '.':
-                    collected_dirs.add(parent_dir)
-            if not recursive:
-                dirs[:] = []
-        return collected_files, sorted(list(collected_dirs), key=lambda d: d.count(os.sep))
-
-    def encode_files(self, files, root, logger):
-        result = {}
-        for rel in files:
-            path = os.path.join(root, rel)
-            try:
-                with open(path, 'rb') as f:
-                    result[rel] = base64.b64encode(f.read()).decode('ascii')
-                logger.debug(f"Encoded {rel}")
-            except Exception as e:
-                logger.warning(f"Could not encode {rel}: {e}")
-        return result
-
-    def build_extractor(self, data_map, directories_to_create, output, logger):
-        lines = [
-            '#!/usr/bin/env python3',
-            'import os, base64, logging, sys',
-            "logging.basicConfig(level=logging.INFO, format='%(message)s', stream=sys.stdout)",
-            '',
-            'def main():',
-        ]
-        if directories_to_create:
-            lines.append('    logging.info("Creating directories...")')
-            for rel_dir in sorted(directories_to_create, key=lambda d: d.count(os.sep)):
-                if rel_dir and rel_dir != '.':
-                    esc_dir = rel_dir.replace('\\', '\\\\').replace("'", "\\'")
-                    lines.extend([
-                        f"    try:",
-                        f"        os.makedirs(r'{esc_dir}', exist_ok=True)",
-                        f"        logging.info(f'  Created directory: {esc_dir}')",
-                        f"    except Exception as e:",
-                        f"        logging.error(f'  Could not create directory {esc_dir}: {{e}}')",
-                    ])
-        lines.append('    logging.info("Extracting files...")')
-        if not data_map:
-            lines.append('    logging.info("  No files to extract.")')
-        else:
-            for rel, b64 in data_map.items():
-                esc = rel.replace('\\', '\\\\').replace("'", "\\'")
-                lines.extend([
-                    f"    try:",
-                    f"        with open(r'{esc}','wb') as f: f.write(base64.b64decode('{b64}'))",
-                    f"        logging.info(f'  Extracted: {esc}')",
-                    f"    except Exception as e:",
-                    f"        logging.error(f'  Could not extract {esc}: {{e}}')",
-                ])
-        lines.append('    logging.info("Extraction complete.")')
-        lines.extend(['', "if __name__ == '__main__':", '    main()'])
-        content = '\n'.join(lines)
-        try:
-            with open(output, 'w', encoding='utf-8') as f:
-                f.write(content)
-            logger.info(f"Wrote extractor to {output}")
-            try:
-                os.chmod(output, 0o755)
-            except Exception as e:
-                logger.warning(f"Could not set executable permission on {output}: {e}")
-        except Exception as e:
-            logger.error(f"Could not write to output file {output}: {e}")
-            return False
-        return True
-
-    def delete_originals_packer(self, root, files_to_delete, dirs_to_delete, logger):
-        logger.info("Cleaning up originals after packing...")
-        for rel in files_to_delete:
-            path = os.path.join(root, rel)
-            try:
-                os.remove(path)
-                logger.info(f"Deleted file {rel}")
-            except FileNotFoundError:
-                pass
-            except Exception as e:
-                logger.warning(f"Could not delete file {rel}: {e}")
-        for rel_dir in sorted(dirs_to_delete, key=lambda d: d.count(os.sep), reverse=True):
-            path = os.path.join(root, rel_dir)
-            if path == os.path.abspath(root):
-                continue
-            try:
-                os.rmdir(path)
-                logger.info(f"Removed empty directory {rel_dir}")
-            except OSError as e:
-                logger.debug(f"Could not remove directory {rel_dir}: {e}")
-            except Exception as e:
-                logger.warning(f"Unexpected error removing directory {rel_dir}: {e}")
 
 class QueueHandler(logging.Handler):
-    """
-    A custom logging handler that directs logs to a queue.
-    The GUI can then pull logs from the queue to display them.
-    """
-    def __init__(self, log_queue):
+    def __init__(self, event_queue):
         super().__init__()
-        self.log_queue = log_queue
+        self.event_queue = event_queue
 
     def emit(self, record):
-        self.log_queue.put(self.format(record))
+        self.event_queue.put(("log", record.levelname, self.format(record)))
+
 
 class PackerApp:
-    """
-    The main class for the Py1Packer GUI.
-    """
     def __init__(self, root):
         self.root = root
-        self.packer_logic = PackerLogic()
-        self.log_queue = queue.Queue()
-        self.setup_logging()
-        self.setup_gui()
+        self.events = queue.Queue()
+        self.worker = None
+        self.default_output = os.path.join(os.getcwd(), "packed.py")
+        self.colors = {
+            "bg": "#0f172a",
+            "panel": "#111827",
+            "panel_alt": "#162033",
+            "field": "#0b1220",
+            "border": "#273449",
+            "text": "#e5e7eb",
+            "muted": "#94a3b8",
+            "accent": "#38bdf8",
+            "accent_dark": "#0ea5e9",
+            "danger": "#f97316",
+            "success": "#22c55e",
+            "error": "#ef4444",
+            "warning": "#f59e0b",
+        }
+        self.setup_variables()
+        self.setup_window()
+        self.setup_styles()
+        self.build_gui()
+        self.root.after(80, self.process_events)
 
-    def setup_logging(self):
-        self.logger = logging.getLogger(__name__)
-        self.logger.setLevel(logging.DEBUG)
-        self.logger.addHandler(QueueHandler(self.log_queue))
-
-    def setup_gui(self):
-        self.root.title("Py1Packer")
-        self.root.geometry("800x650")
-        self.root.minsize(600, 500)
-        self.root.configure(bg="#2E2E2E")
-        style = ttk.Style(self.root)
-        style.theme_use('clam')
-        BG_COLOR = "#2E2E2E"
-        FG_COLOR = "#E0E0E0"
-        INACTIVE_FG_COLOR = "#A0A0A0"
-        ENTRY_BG_COLOR = "#3C3C3C"
-        BUTTON_BG_COLOR = "#007ACC"
-        BUTTON_FG_COLOR = "#FFFFFF"
-        BUTTON_ACTIVE_BG = "#005F9E"
-        FRAME_BG = "#252526"
-        style.configure('.', background=BG_COLOR, foreground=FG_COLOR, fieldbackground=ENTRY_BG_COLOR, borderwidth=0)
-        style.configure('TFrame', background=BG_COLOR)
-        style.configure('TLabel', background=BG_COLOR, foreground=FG_COLOR, font=('Segoe UI', 10))
-        style.configure('TButton', background=BUTTON_BG_COLOR, foreground=BUTTON_FG_COLOR, font=('Segoe UI', 10, 'bold'), borderwidth=1, focusthickness=0)
-        style.map('TButton', background=[('active', BUTTON_ACTIVE_BG)], relief=[('pressed', 'sunken')])
-        style.configure('TCheckbutton', background=BG_COLOR, foreground=FG_COLOR, font=('Segoe UI', 10))
-        style.map('TCheckbutton', background=[('active', BG_COLOR)])
-        style.configure('TLabelframe', background=BG_COLOR, bordercolor=INACTIVE_FG_COLOR)
-        style.configure('TLabelframe.Label', background=BG_COLOR, foreground=FG_COLOR, font=('Segoe UI', 11, 'bold'))
-        style.configure('TEntry', fieldbackground=ENTRY_BG_COLOR, foreground=FG_COLOR, insertcolor=FG_COLOR, bordercolor=INACTIVE_FG_COLOR, borderwidth=1)
-        main_frame = ttk.Frame(self.root, padding="15")
-        main_frame.pack(fill=tk.BOTH, expand=True)
-        main_frame.grid_columnconfigure(1, weight=1)
-        main_frame.grid_rowconfigure(3, weight=1)
-        main_frame.grid_rowconfigure(4, weight=3)
+    def setup_variables(self):
         self.source_dir_var = tk.StringVar()
-        self.output_file_var = tk.StringVar(value=os.path.join(os.getcwd(), "packed.py"))
+        self.output_file_var = tk.StringVar(value=self.default_output)
+        self.exclude_entry_var = tk.StringVar()
         self.recursive_var = tk.BooleanVar(value=True)
         self.delete_packer_var = tk.BooleanVar(value=False)
         self.overwrite_policy_var = tk.StringVar(value="increment")
-        self.exclude_entry_var = tk.StringVar()
-        ttk.Label(main_frame, text="Source Directory:").grid(row=0, column=0, sticky="w", pady=(0, 5))
-        source_entry = ttk.Entry(main_frame, textvariable=self.source_dir_var)
-        source_entry.grid(row=0, column=1, sticky="ew", padx=(5, 5))
-        ttk.Button(main_frame, text="Browse...", command=self.browse_source).grid(row=0, column=2, sticky="ew", padx=(5, 0))
-        ttk.Label(main_frame, text="Output File:").grid(row=1, column=0, sticky="w", pady=(5, 10))
-        output_entry = ttk.Entry(main_frame, textvariable=self.output_file_var)
-        output_entry.grid(row=1, column=1, sticky="ew", padx=(5, 5))
-        ttk.Button(main_frame, text="Save As...", command=self.browse_output).grid(row=1, column=2, sticky="ew", padx=(5, 0))
-        options_frame = ttk.LabelFrame(main_frame, text="Options", padding="10")
-        options_frame.grid(row=2, column=0, columnspan=3, sticky="ew", pady=10)
-        options_frame.grid_columnconfigure(1, weight=1)
-        ttk.Checkbutton(options_frame, text="Recursive", variable=self.recursive_var).grid(row=0, column=0, sticky="w")
-        ttk.Checkbutton(options_frame, text="Delete Originals After Packing", variable=self.delete_packer_var).grid(row=0, column=1, sticky="w", padx=20)
-        ttk.Label(options_frame, text="Overwrite Policy:").grid(row=0, column=2, sticky="w", padx=(20, 5))
-        overwrite_menu = ttk.Combobox(options_frame, textvariable=self.overwrite_policy_var, values=["increment", "skip"], state="readonly", width=12)
-        overwrite_menu.grid(row=0, column=3, sticky="w")
-        exclude_frame = ttk.LabelFrame(main_frame, text="Exclude Relative Paths (Files or Directories)", padding="10")
-        exclude_frame.grid(row=3, column=0, columnspan=3, sticky="nsew", pady=10)
-        exclude_frame.grid_columnconfigure(0, weight=1)
-        exclude_frame.grid_rowconfigure(0, weight=1)
-        self.exclude_listbox = tk.Listbox(exclude_frame, bg=ENTRY_BG_COLOR, fg=FG_COLOR, selectbackground=BUTTON_BG_COLOR, activestyle='none', borderwidth=1, relief="solid")
-        self.exclude_listbox.grid(row=0, column=0, columnspan=2, sticky="nsew", pady=(0, 5))
-        exclude_entry = ttk.Entry(exclude_frame, textvariable=self.exclude_entry_var)
-        exclude_entry.grid(row=1, column=0, sticky="ew", pady=(5, 0), padx=(0, 5))
-        exclude_entry.bind("<Return>", self.add_exclusion)
-        add_remove_frame = ttk.Frame(exclude_frame)
-        add_remove_frame.grid(row=1, column=1, sticky="ew")
-        ttk.Button(add_remove_frame, text="Add", command=self.add_exclusion).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 2))
-        ttk.Button(add_remove_frame, text="Remove Selected", command=self.remove_exclusion).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(2, 0))
-        log_frame = ttk.LabelFrame(main_frame, text="Log", padding="10")
-        log_frame.grid(row=4, column=0, columnspan=3, sticky="nsew", pady=10)
-        log_frame.grid_columnconfigure(0, weight=1)
-        log_frame.grid_rowconfigure(0, weight=1)
-        self.log_text = scrolledtext.ScrolledText(log_frame, state='disabled', bg=ENTRY_BG_COLOR, fg=INACTIVE_FG_COLOR, font=('Consolas', 9), wrap=tk.WORD, borderwidth=1, relief="solid")
-        self.log_text.grid(row=0, column=0, sticky="nsew")
-        action_frame = ttk.Frame(main_frame)
-        action_frame.grid(row=5, column=0, columnspan=3, sticky="ew", pady=(10, 0))
-        action_frame.grid_columnconfigure(0, weight=1)
-        action_frame.grid_columnconfigure(1, weight=1)
-        self.dry_run_button = ttk.Button(action_frame, text="Dry Run", command=lambda: self.start_packing(dry_run=True))
-        self.dry_run_button.grid(row=0, column=0, sticky="ew", padx=(0, 5))
-        self.pack_button = ttk.Button(action_frame, text="Pack", command=lambda: self.start_packing(dry_run=False))
-        self.pack_button.grid(row=0, column=1, sticky="ew", padx=(5, 0))
-        self.root.after(100, self.process_log_queue)
+        self.status_var = tk.StringVar(value="Ready")
+        self.summary_var = tk.StringVar(value="Choose a source directory to begin.")
+
+    def setup_window(self):
+        self.root.title("Py1Packer")
+        self.root.geometry("1060x720")
+        self.root.minsize(860, 620)
+        self.root.configure(bg=self.colors["bg"])
+
+    def setup_styles(self):
+        style = ttk.Style(self.root)
+        style.theme_use("clam")
+        style.configure(".", background=self.colors["bg"], foreground=self.colors["text"], font=("Segoe UI", 10), borderwidth=0, focuscolor=self.colors["accent"])
+        style.configure("TFrame", background=self.colors["bg"])
+        style.configure("Panel.TFrame", background=self.colors["panel"], borderwidth=1, relief="solid")
+        style.configure("Alt.TFrame", background=self.colors["panel_alt"])
+        style.configure("TLabel", background=self.colors["bg"], foreground=self.colors["text"])
+        style.configure("Panel.TLabel", background=self.colors["panel"], foreground=self.colors["text"])
+        style.configure("Muted.TLabel", background=self.colors["panel"], foreground=self.colors["muted"])
+        style.configure("Title.TLabel", background=self.colors["bg"], foreground=self.colors["text"], font=("Segoe UI Semibold", 22))
+        style.configure("Subtitle.TLabel", background=self.colors["bg"], foreground=self.colors["muted"], font=("Segoe UI", 10))
+        style.configure("Status.TLabel", background=self.colors["panel_alt"], foreground=self.colors["accent"], font=("Segoe UI Semibold", 10), padding=(14, 7))
+        style.configure("TEntry", fieldbackground=self.colors["field"], foreground=self.colors["text"], insertcolor=self.colors["text"], bordercolor=self.colors["border"], lightcolor=self.colors["border"], darkcolor=self.colors["border"], padding=8)
+        style.map("TEntry", bordercolor=[("focus", self.colors["accent"])])
+        style.configure("TCombobox", fieldbackground=self.colors["field"], background=self.colors["field"], foreground=self.colors["text"], arrowcolor=self.colors["accent"], bordercolor=self.colors["border"], padding=8)
+        style.map("TCombobox", fieldbackground=[("readonly", self.colors["field"])], foreground=[("readonly", self.colors["text"])])
+        style.configure("TButton", background=self.colors["panel_alt"], foreground=self.colors["text"], font=("Segoe UI Semibold", 10), padding=(12, 9), bordercolor=self.colors["border"])
+        style.map("TButton", background=[("active", self.colors["border"]), ("disabled", self.colors["panel"])], foreground=[("disabled", self.colors["muted"])])
+        style.configure("Accent.TButton", background=self.colors["accent_dark"], foreground="#ffffff", bordercolor=self.colors["accent_dark"])
+        style.map("Accent.TButton", background=[("active", self.colors["accent"]), ("disabled", self.colors["panel"])])
+        style.configure("Danger.TButton", background="#7c2d12", foreground="#fed7aa", bordercolor="#9a3412")
+        style.map("Danger.TButton", background=[("active", "#9a3412")])
+        style.configure("TCheckbutton", background=self.colors["panel"], foreground=self.colors["text"], font=("Segoe UI", 10))
+        style.map("TCheckbutton", background=[("active", self.colors["panel"])], foreground=[("disabled", self.colors["muted"])])
+        style.configure("Horizontal.TProgressbar", troughcolor=self.colors["field"], background=self.colors["accent"], bordercolor=self.colors["field"], lightcolor=self.colors["accent"], darkcolor=self.colors["accent"])
+
+    def build_gui(self):
+        self.root.grid_columnconfigure(0, weight=1)
+        self.root.grid_rowconfigure(1, weight=1)
+
+        header = ttk.Frame(self.root, padding=(22, 20, 22, 12))
+        header.grid(row=0, column=0, sticky="ew")
+        header.grid_columnconfigure(0, weight=1)
+        ttk.Label(header, text="Py1Packer", style="Title.TLabel").grid(row=0, column=0, sticky="w")
+        ttk.Label(header, text="Bundle a folder into one self-extracting Python script.", style="Subtitle.TLabel").grid(row=1, column=0, sticky="w", pady=(4, 0))
+        ttk.Label(header, textvariable=self.status_var, style="Status.TLabel").grid(row=0, column=1, rowspan=2, sticky="e")
+
+        shell = ttk.Frame(self.root, padding=(22, 0, 22, 18))
+        shell.grid(row=1, column=0, sticky="nsew")
+        shell.grid_columnconfigure(0, minsize=390)
+        shell.grid_columnconfigure(1, weight=1)
+        shell.grid_rowconfigure(0, weight=1)
+
+        left = ttk.Frame(shell, style="Panel.TFrame", padding=18)
+        left.grid(row=0, column=0, sticky="nsew", padx=(0, 14))
+        left.grid_columnconfigure(0, weight=1)
+
+        right = ttk.Frame(shell, style="Panel.TFrame", padding=18)
+        right.grid(row=0, column=1, sticky="nsew")
+        right.grid_columnconfigure(0, weight=1)
+        right.grid_rowconfigure(2, weight=1)
+
+        self.build_configuration(left)
+        self.build_log_panel(right)
+        self.busy_widgets = [
+            self.source_entry,
+            self.output_entry,
+            self.browse_source_button,
+            self.browse_output_button,
+            self.exclude_entry,
+            self.add_exclude_button,
+            self.add_file_button,
+            self.add_folder_button,
+            self.remove_exclude_button,
+            self.clear_exclude_button,
+            self.recursive_check,
+            self.delete_check,
+            self.overwrite_menu,
+            self.dry_run_button,
+            self.pack_button,
+        ]
+
+    def build_configuration(self, parent):
+        ttk.Label(parent, text="Source", style="Panel.TLabel", font=("Segoe UI Semibold", 12)).grid(row=0, column=0, sticky="w")
+        ttk.Label(parent, text="Pick the folder that will be embedded.", style="Muted.TLabel").grid(row=1, column=0, sticky="w", pady=(2, 10))
+        source_row = ttk.Frame(parent, style="Panel.TFrame")
+        source_row.grid(row=2, column=0, sticky="ew")
+        source_row.grid_columnconfigure(0, weight=1)
+        self.source_entry = ttk.Entry(source_row, textvariable=self.source_dir_var)
+        self.source_entry.grid(row=0, column=0, sticky="ew", padx=(0, 8))
+        self.browse_source_button = ttk.Button(source_row, text="Browse", command=self.browse_source)
+        self.browse_source_button.grid(row=0, column=1)
+
+        ttk.Label(parent, text="Output", style="Panel.TLabel", font=("Segoe UI Semibold", 12)).grid(row=3, column=0, sticky="w", pady=(22, 0))
+        ttk.Label(parent, text="Choose where the generated script will be written.", style="Muted.TLabel").grid(row=4, column=0, sticky="w", pady=(2, 10))
+        output_row = ttk.Frame(parent, style="Panel.TFrame")
+        output_row.grid(row=5, column=0, sticky="ew")
+        output_row.grid_columnconfigure(0, weight=1)
+        self.output_entry = ttk.Entry(output_row, textvariable=self.output_file_var)
+        self.output_entry.grid(row=0, column=0, sticky="ew", padx=(0, 8))
+        self.browse_output_button = ttk.Button(output_row, text="Save As", command=self.browse_output)
+        self.browse_output_button.grid(row=0, column=1)
+
+        options = ttk.Frame(parent, style="Alt.TFrame", padding=14)
+        options.grid(row=6, column=0, sticky="ew", pady=(22, 0))
+        options.grid_columnconfigure(1, weight=1)
+        self.recursive_check = ttk.Checkbutton(options, text="Include subfolders", variable=self.recursive_var)
+        self.recursive_check.grid(row=0, column=0, columnspan=2, sticky="w")
+        self.delete_check = ttk.Checkbutton(options, text="Delete packed originals", variable=self.delete_packer_var)
+        self.delete_check.grid(row=1, column=0, columnspan=2, sticky="w", pady=(9, 0))
+        ttk.Label(options, text="Overwrite", style="Panel.TLabel").grid(row=2, column=0, sticky="w", pady=(14, 0))
+        self.overwrite_menu = ttk.Combobox(options, textvariable=self.overwrite_policy_var, values=("increment", "skip"), state="readonly", width=14)
+        self.overwrite_menu.grid(row=2, column=1, sticky="e", pady=(14, 0))
+
+        ttk.Label(parent, text="Exclusions", style="Panel.TLabel", font=("Segoe UI Semibold", 12)).grid(row=7, column=0, sticky="w", pady=(22, 0))
+        ttk.Label(parent, text="Relative paths that should not be packed.", style="Muted.TLabel").grid(row=8, column=0, sticky="w", pady=(2, 10))
+        exclude_box = ttk.Frame(parent, style="Panel.TFrame")
+        exclude_box.grid(row=9, column=0, sticky="nsew")
+        exclude_box.grid_columnconfigure(0, weight=1)
+        exclude_box.grid_rowconfigure(0, weight=1)
+        parent.grid_rowconfigure(9, weight=1)
+        self.exclude_listbox = tk.Listbox(exclude_box, height=8, selectmode=tk.EXTENDED, bg=self.colors["field"], fg=self.colors["text"], selectbackground=self.colors["accent_dark"], selectforeground="#ffffff", highlightthickness=1, highlightbackground=self.colors["border"], highlightcolor=self.colors["accent"], relief="flat", activestyle="none", font=("Segoe UI", 10))
+        self.exclude_listbox.grid(row=0, column=0, sticky="nsew")
+        exclude_scroll = ttk.Scrollbar(exclude_box, orient="vertical", command=self.exclude_listbox.yview)
+        exclude_scroll.grid(row=0, column=1, sticky="ns")
+        self.exclude_listbox.configure(yscrollcommand=exclude_scroll.set)
+        self.exclude_entry = ttk.Entry(exclude_box, textvariable=self.exclude_entry_var)
+        self.exclude_entry.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(10, 0))
+        self.exclude_entry.bind("<Return>", self.add_exclusion)
+        exclude_buttons = ttk.Frame(exclude_box, style="Panel.TFrame")
+        exclude_buttons.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(10, 0))
+        for column in range(5):
+            exclude_buttons.grid_columnconfigure(column, weight=1)
+        self.add_exclude_button = ttk.Button(exclude_buttons, text="Add", command=self.add_exclusion)
+        self.add_exclude_button.grid(row=0, column=0, sticky="ew", padx=(0, 6))
+        self.add_file_button = ttk.Button(exclude_buttons, text="File", command=self.add_exclusion_file)
+        self.add_file_button.grid(row=0, column=1, sticky="ew", padx=(0, 6))
+        self.add_folder_button = ttk.Button(exclude_buttons, text="Folder", command=self.add_exclusion_folder)
+        self.add_folder_button.grid(row=0, column=2, sticky="ew", padx=(0, 6))
+        self.remove_exclude_button = ttk.Button(exclude_buttons, text="Remove", command=self.remove_exclusion)
+        self.remove_exclude_button.grid(row=0, column=3, sticky="ew", padx=(0, 6))
+        self.clear_exclude_button = ttk.Button(exclude_buttons, text="Clear", command=self.clear_exclusions)
+        self.clear_exclude_button.grid(row=0, column=4, sticky="ew")
+
+        actions = ttk.Frame(parent, style="Panel.TFrame")
+        actions.grid(row=10, column=0, sticky="ew", pady=(20, 0))
+        actions.grid_columnconfigure(0, weight=1)
+        actions.grid_columnconfigure(1, weight=1)
+        self.dry_run_button = ttk.Button(actions, text="Dry Run", command=lambda: self.start_packing(True))
+        self.dry_run_button.grid(row=0, column=0, sticky="ew", padx=(0, 8))
+        self.pack_button = ttk.Button(actions, text="Pack", style="Accent.TButton", command=lambda: self.start_packing(False))
+        self.pack_button.grid(row=0, column=1, sticky="ew")
+
+    def build_log_panel(self, parent):
+        top = ttk.Frame(parent, style="Panel.TFrame")
+        top.grid(row=0, column=0, sticky="ew")
+        top.grid_columnconfigure(0, weight=1)
+        ttk.Label(top, text="Run Log", style="Panel.TLabel", font=("Segoe UI Semibold", 12)).grid(row=0, column=0, sticky="w")
+        ttk.Button(top, text="Clear", command=self.clear_log).grid(row=0, column=1, sticky="e")
+        ttk.Label(parent, textvariable=self.summary_var, style="Muted.TLabel").grid(row=1, column=0, sticky="w", pady=(4, 12))
+        self.log_text = scrolledtext.ScrolledText(parent, state="disabled", wrap=tk.WORD, bg=self.colors["field"], fg=self.colors["text"], insertbackground=self.colors["text"], selectbackground=self.colors["accent_dark"], relief="flat", highlightthickness=1, highlightbackground=self.colors["border"], highlightcolor=self.colors["accent"], font=("Consolas", 10), padx=12, pady=12)
+        self.log_text.grid(row=2, column=0, sticky="nsew")
+        self.log_text.tag_configure("INFO", foreground=self.colors["text"])
+        self.log_text.tag_configure("DEBUG", foreground=self.colors["muted"])
+        self.log_text.tag_configure("WARNING", foreground=self.colors["warning"])
+        self.log_text.tag_configure("ERROR", foreground=self.colors["error"])
+        self.log_text.tag_configure("SUCCESS", foreground=self.colors["success"])
+        bottom = ttk.Frame(parent, style="Panel.TFrame")
+        bottom.grid(row=3, column=0, sticky="ew", pady=(14, 0))
+        bottom.grid_columnconfigure(0, weight=1)
+        self.progress = ttk.Progressbar(bottom, mode="indeterminate")
+        self.progress.grid(row=0, column=0, sticky="ew", padx=(0, 10))
+        ttk.Label(bottom, text="Idle", textvariable=self.status_var, style="Muted.TLabel").grid(row=0, column=1, sticky="e")
 
     def browse_source(self):
-        directory = filedialog.askdirectory(title="Select Source Directory")
-        if directory:
-            self.source_dir_var.set(directory)
+        selected = filedialog.askdirectory(title="Select source directory")
+        if selected:
+            self.source_dir_var.set(selected)
+            current_output = self.output_file_var.get().strip()
+            if not current_output or current_output == self.default_output:
+                source_name = Path(selected).name or "packed"
+                self.output_file_var.set(str(Path(selected).parent / f"{source_name}_packed.py"))
+            self.summary_var.set("Source folder selected.")
 
     def browse_output(self):
-        filename = filedialog.asksaveasfilename(
-            title="Save Output Script As",
-            defaultextension=".py",
-            filetypes=[("Python Scripts", "*.py"), ("All Files", "*.*")]
-        )
-        if filename:
-            self.output_file_var.set(filename)
+        selected = filedialog.asksaveasfilename(title="Save output script as", defaultextension=".py", filetypes=(("Python scripts", "*.py"), ("All files", "*.*")))
+        if selected:
+            self.output_file_var.set(selected)
 
     def add_exclusion(self, event=None):
-        path = self.exclude_entry_var.get().strip()
-        if path and path not in self.exclude_listbox.get(0, tk.END):
-            self.exclude_listbox.insert(tk.END, path)
-            self.exclude_entry_var.set("")
+        value = py1packer.normalize_archive_path(self.exclude_entry_var.get())
+        if value != "." and value not in self.exclude_listbox.get(0, tk.END):
+            self.exclude_listbox.insert(tk.END, value)
+        self.exclude_entry_var.set("")
+
+    def add_exclusion_file(self):
+        root_dir = self.source_dir_var.get().strip()
+        selected = filedialog.askopenfilename(title="Select file to exclude", initialdir=root_dir if os.path.isdir(root_dir) else os.getcwd())
+        self.add_exclusion_path(selected)
+
+    def add_exclusion_folder(self):
+        root_dir = self.source_dir_var.get().strip()
+        selected = filedialog.askdirectory(title="Select folder to exclude", initialdir=root_dir if os.path.isdir(root_dir) else os.getcwd())
+        self.add_exclusion_path(selected)
+
+    def add_exclusion_path(self, selected):
+        if not selected:
+            return
+        root_dir = self.source_dir_var.get().strip()
+        value = selected
+        if root_dir and os.path.isdir(root_dir) and py1packer.path_is_inside(selected, root_dir):
+            value = os.path.relpath(selected, root_dir)
+        value = py1packer.normalize_archive_path(value)
+        if value != "." and value not in self.exclude_listbox.get(0, tk.END):
+            self.exclude_listbox.insert(tk.END, value)
 
     def remove_exclusion(self):
-        selected_indices = self.exclude_listbox.curselection()
-        for i in reversed(selected_indices):
-            self.exclude_listbox.delete(i)
+        for index in reversed(self.exclude_listbox.curselection()):
+            self.exclude_listbox.delete(index)
 
-    def process_log_queue(self):
+    def clear_exclusions(self):
+        self.exclude_listbox.delete(0, tk.END)
+
+    def clear_log(self):
+        self.log_text.configure(state="normal")
+        self.log_text.delete("1.0", tk.END)
+        self.log_text.configure(state="disabled")
+
+    def validate_job(self, dry_run):
+        root_dir = self.source_dir_var.get().strip()
+        output_file = self.output_file_var.get().strip()
+        if not root_dir or not os.path.isdir(root_dir):
+            messagebox.showerror("Invalid source", "Select an existing source directory.")
+            return None
+        if not dry_run and not output_file:
+            messagebox.showerror("Invalid output", "Choose an output file.")
+            return None
+        if self.delete_packer_var.get() and not dry_run:
+            confirmed = messagebox.askyesno("Delete originals", "This will delete packed original files after the extractor is written. Continue?")
+            if not confirmed:
+                return None
+        return {
+            "root": root_dir,
+            "output": output_file or self.default_output,
+            "overwrite": self.overwrite_policy_var.get(),
+            "recursive": self.recursive_var.get(),
+            "exclude": list(self.exclude_listbox.get(0, tk.END)),
+            "delete_packer": self.delete_packer_var.get(),
+            "dry_run": dry_run,
+        }
+
+    def set_busy(self, busy):
+        state = "disabled" if busy else "normal"
+        for widget in self.busy_widgets:
+            try:
+                widget.configure(state=state)
+            except tk.TclError:
+                pass
+        if not busy:
+            self.overwrite_menu.configure(state="readonly")
+
+    def start_packing(self, dry_run):
+        if self.worker and self.worker.is_alive():
+            return
+        job = self.validate_job(dry_run)
+        if not job:
+            return
+        self.clear_log()
+        self.set_busy(True)
+        self.status_var.set("Running")
+        self.summary_var.set("Scanning files and preparing package...")
+        self.progress.start(10)
+        self.worker = threading.Thread(target=self.run_job, args=(job,), daemon=True)
+        self.worker.start()
+
+    def run_job(self, job):
+        handler = QueueHandler(self.events)
+        handler.setLevel(logging.DEBUG)
+        handler.setFormatter(logging.Formatter("%(levelname)s  %(message)s"))
+        logger = logging.getLogger()
+        previous_level = logger.level
+        logger.addHandler(handler)
+        logger.setLevel(logging.DEBUG)
+        try:
+            logging.info("Starting %s", "dry run" if job["dry_run"] else "pack")
+            logging.info("Source: %s", job["root"])
+            logging.info("Output: %s", job["output"])
+            logging.info("Recursive: %s", job["recursive"])
+            logging.info("Overwrite policy: %s", job["overwrite"])
+            if job["exclude"]:
+                logging.info("Exclusions: %s", ", ".join(job["exclude"]))
+            result = py1packer.pack_directory(job["root"], job["output"], overwrite=job["overwrite"], recursive=job["recursive"], exclude=job["exclude"], dry_run=job["dry_run"], delete_packer=job["delete_packer"])
+            if job["dry_run"]:
+                logging.info("")
+                logging.info("Files that would be packed:")
+                if result["files"]:
+                    for rel in result["files"]:
+                        logging.info("  %s", rel)
+                else:
+                    logging.info("  No files matched.")
+                logging.info("")
+                logging.info("Directories that would be created:")
+                if result["directories"]:
+                    for rel in result["directories"]:
+                        logging.info("  %s", rel)
+                else:
+                    logging.info("  No directories matched.")
+            self.events.put(("done", True, result))
+        except py1packer.PackerError as exc:
+            logging.error("%s", exc)
+            self.events.put(("done", False, None))
+        except Exception:
+            logging.exception("Unexpected failure")
+            self.events.put(("done", False, None))
+        finally:
+            logger.removeHandler(handler)
+            logger.setLevel(previous_level)
+
+    def process_events(self):
         try:
             while True:
-                record = self.log_queue.get_nowait()
-                self.log_text.configure(state='normal')
-                self.log_text.insert(tk.END, record + '\n')
-                self.log_text.configure(state='disabled')
-                self.log_text.see(tk.END)
+                event = self.events.get_nowait()
+                if event[0] == "log":
+                    self.append_log(event[1], event[2])
+                elif event[0] == "done":
+                    self.finish_job(event[1], event[2])
         except queue.Empty:
             pass
-        finally:
-            self.root.after(100, self.process_log_queue)
-    
-    def set_ui_state(self, enabled):
-        state = 'normal' if enabled else 'disabled'
-        self.pack_button.config(state=state)
-        self.dry_run_button.config(state=state)
+        self.root.after(80, self.process_events)
 
-    def start_packing(self, dry_run=False):
-        source_dir = self.source_dir_var.get()
-        if not source_dir or not os.path.isdir(source_dir):
-            messagebox.showerror("Error", "Please select a valid source directory.")
-            return
-        self.log_text.configure(state='normal')
-        self.log_text.delete(1.0, tk.END)
-        self.log_text.configure(state='disabled')
-        self.set_ui_state(False)
-        thread = threading.Thread(target=self._run_packing_thread, args=(dry_run,), daemon=True)
-        thread.start()
+    def append_log(self, level, message):
+        tag = level if level in ("DEBUG", "INFO", "WARNING", "ERROR") else "INFO"
+        self.log_text.configure(state="normal")
+        self.log_text.insert(tk.END, message + "\n", tag)
+        self.log_text.configure(state="disabled")
+        self.log_text.see(tk.END)
 
-    def _run_packing_thread(self, dry_run):
-        try:
-            root_dir = self.source_dir_var.get()
-            output_file = self.output_file_var.get()
-            overwrite_policy = self.overwrite_policy_var.get()
-            is_recursive = self.recursive_var.get()
-            do_delete_packer = self.delete_packer_var.get()
-            excludes = list(self.exclude_listbox.get(0, tk.END))
-            self.logger.info("="*50)
-            self.logger.info(f"Starting {'DRY RUN' if dry_run else 'PACK'} operation...")
-            self.logger.info(f"Source: {root_dir}")
-            self.logger.info(f"Output: {output_file}")
-            self.logger.info(f"Recursive: {is_recursive}, Delete Originals: {do_delete_packer}")
-            try:
-                if os.path.abspath(output_file).startswith(os.path.abspath(root_dir)):
-                    output_rel = os.path.relpath(output_file, root_dir)
-                    if output_rel not in excludes:
-                        excludes.append(os.path.normpath(output_rel))
-                        self.logger.info(f"Auto-excluding output file: {output_rel}")
-            except (ValueError, TypeError): pass
-            self.logger.info(f"Final exclude patterns: {excludes if excludes else 'None'}")
-            files_to_pack, dirs_to_create = self.packer_logic.gather_files(root_dir, excludes, is_recursive, self.logger)
-            self.logger.info(f"Found {len(files_to_pack)} files and {len(dirs_to_create)} directories to include.")
-            if dry_run:
-                self.logger.info("\n--- Files to be packed ---")
-                for f in files_to_pack: self.logger.info(f"  - {f}")
-                self.logger.info("\n--- Directories to be created in extractor ---")
-                for d in dirs_to_create: self.logger.info(f"  - {d}")
-                self.logger.info("\nDRY RUN COMPLETE: No files were written or deleted.")
-                return
-            final_output_path = self.packer_logic.find_output_path(output_file, overwrite_policy, self.logger)
-            if not final_output_path:
-                self.logger.error("Packing failed: Could not determine output path.")
-                return
-            encoded_data = self.packer_logic.encode_files(files_to_pack, root_dir, self.logger)
-            success = self.packer_logic.build_extractor(encoded_data, dirs_to_create, final_output_path, self.logger)
-            if not success:
-                 self.logger.error("Packing failed: Could not build extractor script.")
-                 return
-            self.logger.info(f"Successfully packed into {final_output_path}")
-            if do_delete_packer:
-                self.packer_logic.delete_originals_packer(root_dir, files_to_pack, dirs_to_create, self.logger)
-            self.logger.info("Operation finished successfully.")
-        except Exception as e:
-            self.logger.error(f"\nAn unexpected error occurred: {e}", exc_info=True)
-        finally:
-            self.set_ui_state(True)
+    def finish_job(self, success, result):
+        self.progress.stop()
+        self.set_busy(False)
+        if success:
+            files = len(result["files"])
+            directories = len(result["directories"])
+            output = result.get("output")
+            if output:
+                self.status_var.set("Complete")
+                self.summary_var.set(f"Packed {files} files and {directories} directories into {output}.")
+                self.append_log("SUCCESS", f"SUCCESS  Packed {files} files into {output}")
+            else:
+                self.status_var.set("Dry run complete")
+                self.summary_var.set(f"Dry run found {files} files and {directories} directories.")
+                self.append_log("SUCCESS", f"SUCCESS  Dry run found {files} files")
+        else:
+            self.status_var.set("Failed")
+            self.summary_var.set("The operation failed. Check the log for details.")
 
-if __name__ == '__main__':
+
+def main():
     root = tk.Tk()
-    app = PackerApp(root)
+    PackerApp(root)
     root.mainloop()
+
+
+if __name__ == "__main__":
+    main()

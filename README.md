@@ -1,35 +1,45 @@
-`py1packer` is a python script that packs files from a directory into a single, self-extracting python script.
+# Py1Packer
 
-### features
-* packs files from a specified directory into a single python script.
-* supports overwriting policies (`skip`, `increment`).
-* can recursively pack subdirectories.
-* allows excluding specific files or directories using patterns.
-* includes a `dry-run` mode to preview actions without actual file operations.
-* can delete original files after packing.
-* provides verbose logging for debugging.
+Py1Packer packs a directory into one self-extracting Python script. It includes a command-line interface and a dark Tkinter GUI.
 
-### usage
+## Features
+
+- Packs files into a standalone Python extractor.
+- Supports recursive and top-level-only packing.
+- Supports `skip` and `increment` overwrite policies.
+- Excludes relative files or folders.
+- Runs dry runs before writing anything.
+- Can delete packed originals after a successful package write.
+- Preserves empty included directories.
+- Creates parent folders during extraction.
+
+## GUI
+
 ```bash
-python3 packer.py <directory_to_pack> [options]
+python py1packer_gui.py
 ```
 
-### options
-* `-o, --output <file>`: specify the output script name (default: `packed.py`).
-* `--overwrite {skip,increment}`: set the overwrite policy for the output file (default: `increment`).
-* `-r, --recursive`: include subdirectories when packing.
-* `-e, --exclude <paths>`: exclude relative paths (files or directories) from packing.
-* `--delete-packer`: delete original files and empty directories after packing.
-* `--dry-run`: show what would be done without actually writing or deleting.
-* `-v, --verbose`: enable debug mode for more detailed logging.
+The GUI provides source/output pickers, dark themed controls, exclusion helpers, dry-run preview, progress state, and color-coded logs.
 
-### example
-pack a directory named `my_files` recursively into `my_packed_app.py`, deleting originals:
+## CLI
+
 ```bash
-python3 packer.py my_files -o my_packed_app.py -r --delete-packer
+python py1packer.py <directory_to_pack> [options]
 ```
 
-to extract files from `my_packed_app.py`:
+## Options
+
+- `-o, --output <file>`: output script path. Defaults to `packed.py`.
+- `--overwrite {skip,increment}`: output collision behavior. Defaults to `increment`.
+- `-r, --recursive`: include subdirectories.
+- `-e, --exclude <paths>`: relative files or directories to exclude.
+- `--delete-packer`: delete packed originals after writing the extractor.
+- `--dry-run`: preview what would be packed without writing or deleting.
+- `-v, --verbose`: enable debug logging.
+
+## Example
+
 ```bash
-python3 my_packed_app.py
+python py1packer.py my_files -o my_packed_app.py -r --delete-packer
+python my_packed_app.py
 ```

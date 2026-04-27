@@ -1,293 +1,284 @@
 #!/usr/bin/env python3
-'''
-py1packer: pack files in a directory into a single self-extracting Python script, then optionally delete originals of the packed directory.
-The self-extracting script unpacks files and leaves them by default.
-Features:
-  - overwrite policies: skip, increment
-  - recursive packing
-  - exclude patterns
-  - dry-run mode
-  - delete originals after packing
-  - verbose/debug logging
-'''
-
 import argparse
 import base64
+import json
 import logging
 import os
 import sys
-import shutil  # Import shutil for rmtree
-
 from itertools import count
+
+
+class PackerError(Exception):
+    pass
+
+
+def normalize_archive_path(path):
+    normalized = os.path.normpath(str(path)).replace("\\", "/").strip("/")
+    return "." if normalized in ("", ".") else normalized
+
+
+def path_is_inside(path, root):
+    try:
+        path_abs = os.path.abspath(path)
+        root_abs = os.path.abspath(root)
+        return os.path.commonpath([path_abs, root_abs]) == root_abs
+    except (OSError, ValueError):
+        return False
+
+
+def normalize_excludes(exclude, root_dir=None):
+    patterns = []
+    for item in exclude or []:
+        if item is None:
+            continue
+        raw = str(item).strip()
+        if not raw:
+            continue
+        if root_dir and os.path.isabs(raw) and path_is_inside(raw, root_dir):
+            raw = os.path.relpath(raw, root_dir)
+        patterns.append(normalize_archive_path(raw))
+    return sorted(set(patterns))
+
+
+def is_excluded(relative_path, patterns):
+    path = normalize_archive_path(relative_path)
+    for pattern in patterns:
+        if pattern == ".":
+            return True
+        prefix = pattern.rstrip("/") + "/"
+        if path == pattern or path.startswith(prefix):
+            return True
+    return False
 
 
 def find_output_path(base, policy):
     if not os.path.exists(base):
         return base
-    if policy == 'skip':
-        logging.error(f"output exists and policy=skip: {base}")
-        sys.exit(1)
-    if policy == 'increment':
+    if policy == "skip":
+        raise PackerError(f"output exists and policy=skip: {base}")
+    if policy == "increment":
         name, ext = os.path.splitext(base)
         for i in count(2):
             candidate = f"{name}_{i}{ext}"
             if not os.path.exists(candidate):
                 return candidate
-    logging.error(f"unknown overwrite policy: {policy}")
-    sys.exit(1)
+    raise PackerError(f"unknown overwrite policy: {policy}")
 
 
 def gather_files(root_dir, exclude, recursive):
-    patterns = set(exclude or [])
+    patterns = normalize_excludes(exclude)
     collected_files = []
-    collected_dirs = set()  # Keep track of directories
-    # Walk topdown=True by default
+    collected_dirs = set()
+
     for dirpath, dirs, files in os.walk(root_dir, topdown=True):
-        # Exclude directories based on patterns
-        # Create a new list for dirs to allow modification during iteration
-        dirs_to_process = []
-        for d in dirs:
-            rel_dir = os.path.relpath(os.path.join(dirpath, d), root_dir)
-            # Check if the directory itself or any parent is explicitly excluded
-            if any(rel_dir == p or rel_dir.startswith(p + os.sep) for p in patterns):
-                logging.debug(f"excluded directory {rel_dir}")
-            else:
-                dirs_to_process.append(d)
-                # Add the directory itself if it's not the root
-                if rel_dir != '.':
-                    collected_dirs.add(rel_dir)
+        dirs.sort()
+        files.sort()
 
-        dirs[:] = dirs_to_process  # Update dirs in-place for os.walk
-
-        for fname in files:
-            full = os.path.join(dirpath, fname)
-            rel = os.path.relpath(full, root_dir)
-            # Check if the file or its parent directory is explicitly excluded
-            if any(rel == p or rel.startswith(p + os.sep) or os.path.dirname(rel).startswith(p + os.sep) for p in patterns):
-                logging.debug(f"excluded file {rel}")
-                continue
-
-            collected_files.append(rel)
-            # Add parent directories of the file to collected_dirs
-            parent_dir = os.path.dirname(rel)
-            if parent_dir and parent_dir != '.':
-                collected_dirs.add(parent_dir)
-
-        if not recursive:
-            # If not recursive, stop processing subdirectories
+        if recursive:
+            kept_dirs = []
+            for dirname in dirs:
+                rel_dir = normalize_archive_path(os.path.relpath(os.path.join(dirpath, dirname), root_dir))
+                if is_excluded(rel_dir, patterns):
+                    logging.debug("excluded directory %s", rel_dir)
+                    continue
+                kept_dirs.append(dirname)
+                collected_dirs.add(rel_dir)
+            dirs[:] = kept_dirs
+        else:
             dirs[:] = []
 
-    # Sort directories by depth (parent before child) for reliable creation
-    sorted_dirs = sorted(list(collected_dirs), key=lambda d: d.count(os.sep))
+        for filename in files:
+            full_path = os.path.join(dirpath, filename)
+            rel_file = normalize_archive_path(os.path.relpath(full_path, root_dir))
+            if is_excluded(rel_file, patterns):
+                logging.debug("excluded file %s", rel_file)
+                continue
+            collected_files.append(rel_file)
+            parent = os.path.dirname(rel_file).replace("\\", "/")
+            if parent and parent != ".":
+                collected_dirs.add(parent)
 
-    return collected_files, sorted_dirs
+    directories = sorted(collected_dirs, key=lambda item: (item.count("/"), item))
+    return collected_files, directories
 
 
 def encode_files(files, root):
     result = {}
     for rel in files:
-        path = os.path.join(root, rel)
+        path = os.path.join(root, *rel.split("/"))
         try:
-            with open(path, 'rb') as f:
-                result[rel] = base64.b64encode(f.read()).decode('ascii')
-            logging.debug(f"encoded {rel}")
-        except Exception as e:
-            logging.warning(f"could not encode {rel}: {e}")
-            # Optionally skip this file or exit
+            with open(path, "rb") as handle:
+                result[rel] = base64.b64encode(handle.read()).decode("ascii")
+            logging.debug("encoded %s", rel)
+        except OSError as exc:
+            logging.warning("could not encode %s: %s", rel, exc)
     return result
 
 
-# Removed no_delete_extract parameter as extractor defaults to not deleting
 def build_extractor(data_map, directories_to_create, output):
-    lines = []
-    lines.append('#!/usr/bin/env python3')
-    lines.append('import os, base64, logging')
-    lines.append(
-        "logging.basicConfig(level=logging.INFO, format='%(message)s')")
-    lines.append('')
-    lines.append('def main():')
-
-    # Create directories first, from parent to child
-    if directories_to_create:  # Only add this section if there are directories to create
-        lines.append('    logging.info("creating directories...")')
-        for rel_dir in sorted(directories_to_create, key=lambda d: d.count(os.sep)):
-            if rel_dir and rel_dir != '.':  # Don't try to create the current directory
-                esc_dir = rel_dir.replace('\\', '\\\\').replace("'", "\\'")
-                lines.append(f"    try:")
-                lines.append(
-                    f"        os.makedirs(r'{esc_dir}', exist_ok=True)")
-                lines.append(
-                    f"        logging.info('created directory {esc_dir}')")
-                lines.append(f"    except Exception as e:")
-                lines.append(
-                    f"        logging.error(f'could not create directory {esc_dir}: {{e}}')")
-
-    lines.append('    logging.info("extracting files...")')
-    if not data_map:  # Add a message if no files were packed
-        lines.append('    logging.info("no files to extract.")')
-    else:
-        for rel, b64 in data_map.items():
-            esc = rel.replace('\\', '\\\\').replace("'", "\\'")
-            lines.append(f"    try:")
-            lines.append(
-                f"        with open(r'{esc}','wb') as f: f.write(base64.b64decode('{b64}'))")
-            lines.append(f"        logging.info('extracted {esc}')")
-            lines.append(f"    except Exception as e:")
-            lines.append(
-                f"        logging.error(f'could not extract {esc}: {{e}}')")
-
-    # Removed the cleanup logic (file and directory deletion) from the generated script
-
-    lines.append('')
-    lines.append("if __name__ == '__main__':")
-    lines.append('    main()')
-    content = '\n'.join(lines)
-
+    directories = sorted(set(normalize_archive_path(path) for path in directories_to_create if normalize_archive_path(path) != "."))
+    data = {normalize_archive_path(path): value for path, value in data_map.items()}
+    lines = [
+        "#!/usr/bin/env python3",
+        "import base64",
+        "import logging",
+        "import os",
+        "import sys",
+        f"DATA = {json.dumps(data, sort_keys=True)}",
+        f"DIRECTORIES = {json.dumps(directories)}",
+        "logging.basicConfig(level=logging.INFO, format='%(message)s', stream=sys.stdout)",
+        "",
+        "def archive_target(relative_path):",
+        "    normalized = relative_path.replace('\\\\', '/')",
+        "    parts = [part for part in normalized.split('/') if part not in ('', '.')]",
+        "    if not parts or any(part == '..' for part in parts):",
+        "        raise ValueError(f'unsafe path: {relative_path}')",
+        "    return os.path.join(*parts)",
+        "",
+        "def main():",
+        "    failures = 0",
+        "    if DIRECTORIES:",
+        "        logging.info('Creating directories...')",
+        "    for relative_dir in DIRECTORIES:",
+        "        try:",
+        "            target_dir = archive_target(relative_dir)",
+        "            os.makedirs(target_dir, exist_ok=True)",
+        "            logging.info(f'  Created directory: {relative_dir}')",
+        "        except Exception as exc:",
+        "            logging.error(f'  Could not create directory {relative_dir}: {exc}')",
+        "            failures += 1",
+        "    logging.info('Extracting files...')",
+        "    if not DATA:",
+        "        logging.info('  No files to extract.')",
+        "    for relative_file, payload in DATA.items():",
+        "        try:",
+        "            target_file = archive_target(relative_file)",
+        "            parent = os.path.dirname(target_file)",
+        "            if parent:",
+        "                os.makedirs(parent, exist_ok=True)",
+        "            with open(target_file, 'wb') as handle:",
+        "                handle.write(base64.b64decode(payload))",
+        "            logging.info(f'  Extracted: {relative_file}')",
+        "        except Exception as exc:",
+        "            logging.error(f'  Could not extract {relative_file}: {exc}')",
+        "            failures += 1",
+        "    if failures:",
+        "        logging.error(f'Extraction completed with {failures} error(s).')",
+        "        sys.exit(1)",
+        "    logging.info('Extraction complete.')",
+        "",
+        "if __name__ == '__main__':",
+        "    main()",
+    ]
     try:
-        with open(output, 'w', encoding='utf-8') as f:
-            f.write(content)
-        logging.info(f"wrote extractor to {output}")
+        parent = os.path.dirname(os.path.abspath(output))
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        with open(output, "w", encoding="utf-8", newline="\n") as handle:
+            handle.write("\n".join(lines) + "\n")
+        logging.info("wrote extractor to %s", output)
         try:
             os.chmod(output, 0o755)
-        except Exception as e:
-            logging.warning(
-                f"could not set executable permission on {output}: {e}")
-    except Exception as e:
-        logging.error(f"could not write to output file {output}: {e}")
+        except OSError as exc:
+            logging.warning("could not set executable permission on %s: %s", output, exc)
+    except OSError as exc:
+        logging.error("could not write to output file %s: %s", output, exc)
         sys.exit(1)
 
 
 def delete_originals_packer(root, files_to_delete, dirs_to_delete):
     logging.info("cleaning up originals after packing...")
-    # Delete files first
     for rel in files_to_delete:
-        path = os.path.join(root, rel)
+        path = os.path.join(root, *normalize_archive_path(rel).split("/"))
         try:
             os.remove(path)
-            logging.info(f"deleted file {rel}")
+            logging.info("deleted file %s", rel)
         except FileNotFoundError:
-            pass  # Already gone, no problem
-        except Exception as e:
-            logging.warning(f"could not delete file {rel}: {e}")
+            continue
+        except OSError as exc:
+            logging.warning("could not delete file %s: %s", rel, exc)
 
-    # Delete empty directories bottom-up
-    # Sort directories from child to parent for deletion
-    for rel_dir in sorted(dirs_to_delete, key=lambda d: d.count(os.sep), reverse=True):
-        path = os.path.join(root, rel_dir)
-        # Don't try to remove the root directory itself
-        if path == os.path.abspath(root):
+    for rel_dir in sorted(dirs_to_delete, key=lambda item: (item.count("/"), item), reverse=True):
+        path = os.path.join(root, *normalize_archive_path(rel_dir).split("/"))
+        if os.path.abspath(path) == os.path.abspath(root):
             continue
         try:
             os.rmdir(path)
-            logging.info(f"removed empty directory {rel_dir}")
-        except OSError as e:
-            # This is expected if the directory is not empty (e.g., due to an excluded file)
-            logging.debug(f"could not remove directory {rel_dir}: {e}")
-        except Exception as e:
-            logging.warning(
-                f"unexpected error removing directory {rel_dir}: {e}")
+            logging.info("removed empty directory %s", rel_dir)
+        except OSError as exc:
+            logging.debug("could not remove directory %s: %s", rel_dir, exc)
 
 
-def parse_args():
-    p = argparse.ArgumentParser(
-        description='Pack a directory into a self-extracting script')
-    p.add_argument('directory', help='dir to pack')
-    p.add_argument('-o', '--output', default='packed.py', help='output script')
-    p.add_argument('--overwrite', choices=['skip', 'increment'],
-                   default='increment', help='overwrite policy')
-    p.add_argument('-r', '--recursive', action='store_true',
-                   help='include subdirs')
-    # Use type=str for exclude to handle relative paths correctly
-    p.add_argument('-e', '--exclude', nargs='*', type=str, default=[],
-                   help='relative paths (files or directories) to exclude')
-    # Removed --no-delete-extractor flag
-    # Explicit flag for deletion after packing
-    p.add_argument('--delete-packer', action='store_true',
-                   help='delete originals after packing')
-    p.add_argument('--dry-run', action='store_true',
-                   help='show actions without writing or deleting')
-    p.add_argument('-v', '--verbose', action='store_true', help='debug mode')
-    return p.parse_args()
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(description="Pack a directory into a self-extracting script")
+    parser.add_argument("directory", help="directory to pack")
+    parser.add_argument("-o", "--output", default="packed.py", help="output script")
+    parser.add_argument("--overwrite", choices=["skip", "increment"], default="increment", help="overwrite policy")
+    parser.add_argument("-r", "--recursive", action="store_true", help="include subdirectories")
+    parser.add_argument("-e", "--exclude", nargs="*", default=[], help="relative files or directories to exclude")
+    parser.add_argument("--delete-packer", action="store_true", help="delete packed originals after writing the extractor")
+    parser.add_argument("--dry-run", action="store_true", help="show actions without writing or deleting")
+    parser.add_argument("-v", "--verbose", action="store_true", help="debug logging")
+    return parser.parse_args(argv)
 
 
-def main():
-    args = parse_args()
-    lvl = logging.DEBUG if args.verbose else logging.INFO
-    logging.basicConfig(level=lvl, format='%(levelname)s: %(message)s')
+def prepare_excludes(root, output, excludes):
+    root_abs = os.path.abspath(root)
+    prepared = normalize_excludes(excludes, root_abs)
+    for candidate in (output, __file__):
+        candidate_abs = os.path.abspath(candidate)
+        if candidate_abs != root_abs and path_is_inside(candidate_abs, root_abs):
+            prepared.append(normalize_archive_path(os.path.relpath(candidate_abs, root_abs)))
+    return sorted(set(prepared))
 
-    root = args.directory
+
+def pack_directory(root, output, overwrite="increment", recursive=False, exclude=None, dry_run=False, delete_packer=False):
     if not os.path.isdir(root):
-        logging.error(f"not a directory: {root}")
+        raise NotADirectoryError(root)
+
+    excludes = prepare_excludes(root, output, exclude or [])
+    logging.debug("final exclude patterns: %s", excludes)
+    files_to_pack, dirs_to_create = gather_files(root, excludes, recursive)
+    logging.info("found %d files and %d directories to include", len(files_to_pack), len(dirs_to_create))
+    logging.debug("files to pack: %s", files_to_pack)
+    logging.debug("directories to include: %s", dirs_to_create)
+
+    if dry_run:
+        logging.info("dry-run: no files written or deleted")
+        return {"output": None, "files": files_to_pack, "directories": dirs_to_create, "excludes": excludes}
+
+    final_output = find_output_path(output, overwrite)
+    encoded = encode_files(files_to_pack, root)
+    build_extractor(encoded, dirs_to_create, final_output)
+    logging.info("packed into %s", final_output)
+
+    if delete_packer:
+        delete_originals_packer(root, list(encoded.keys()), dirs_to_create)
+
+    return {"output": final_output, "files": files_to_pack, "directories": dirs_to_create, "excludes": excludes}
+
+
+def main(argv=None):
+    args = parse_args(argv)
+    level = logging.DEBUG if args.verbose else logging.INFO
+    logging.basicConfig(level=level, format="%(levelname)s: %(message)s")
+    try:
+        pack_directory(
+            args.directory,
+            args.output,
+            overwrite=args.overwrite,
+            recursive=args.recursive,
+            exclude=args.exclude,
+            dry_run=args.dry_run,
+            delete_packer=args.delete_packer,
+        )
+    except NotADirectoryError:
+        logging.error("not a directory: %s", args.directory)
+        sys.exit(1)
+    except PackerError as exc:
+        logging.error("%s", exc)
         sys.exit(1)
 
-    # Ensure exclude paths are relative to the root directory and normalized
-    excludes = [os.path.normpath(os.path.relpath(p, root)) if os.path.isabs(
-        p) else os.path.normpath(p) for p in args.exclude]
-    # Always exclude the output file and the packer script itself if they are within the root
-    try:
-        packer_script_abs = os.path.abspath(__file__)
-        root_abs = os.path.abspath(root)
-        if packer_script_abs.startswith(root_abs + os.sep) or packer_script_abs == root_abs:
-            packer_script_rel = os.path.relpath(packer_script_abs, root_abs)
-            excludes.append(os.path.normpath(packer_script_rel))
-    except ValueError:  # Handles cases where root and script are on different drives
-        pass
 
-    output_abs = os.path.abspath(args.output)
-    root_abs = os.path.abspath(root)
-    if output_abs.startswith(root_abs + os.sep) or output_abs == root_abs:
-        output_rel = os.path.relpath(output_abs, root_abs)
-        excludes.append(os.path.normpath(output_rel))
-
-    # Remove duplicates from excludes
-    excludes = list(set(excludes))
-    logging.debug(f"final exclude patterns: {excludes}")
-
-    files_to_pack, dirs_to_include_in_extractor = gather_files(
-        root, excludes, args.recursive)
-    logging.info(
-        f"found {len(files_to_pack)} files and {len(dirs_to_include_in_extractor)} directories to include in the extractor")
-    logging.debug(f"files to pack: {files_to_pack}")
-    logging.debug(f"directories to include: {dirs_to_include_in_extractor}")
-
-    enc = encode_files(files_to_pack, root)
-    if args.dry_run:
-        logging.info("dry-run: no files written or deleted")
-        return
-
-    # Pass the list of directories that need to be created by the extractor
-    # Removed no_delete_extractor argument
-    build_extractor(enc, dirs_to_include_in_extractor, args.output)
-    logging.info(f"packed into {args.output}")
-
-    # Delete originals in packer only if --delete-packer is specified
-    if args.delete_packer:
-        # We need to identify the files and directories that *were* processed for packing
-        # This is slightly different from files_to_pack and dirs_to_include_in_extractor
-        # because those lists are already filtered by excludes.
-        # We need to get the list *before* excluding.
-        # A simpler approach for deletion is to walk the original directory again,
-        # and delete anything *not* in the exclude list and not the output file/packer script.
-
-        logging.info("identifying originals for deletion...")
-        originals_to_delete = []
-        original_dirs_to_delete = set()
-        # Walk bottom-up for deletion
-        for dirpath, dirs, files in os.walk(root, topdown=False):
-            for fname in files:
-                full_path = os.path.join(dirpath, fname)
-                rel_path = os.path.relpath(full_path, root)
-                if os.path.normpath(rel_path) not in excludes:
-                    originals_to_delete.append(os.path.normpath(rel_path))
-
-            # Collect directories that might become empty
-            rel_dir_path = os.path.relpath(dirpath, root)
-            if os.path.normpath(rel_dir_path) != '.' and os.path.normpath(rel_dir_path) not in excludes:
-                original_dirs_to_delete.add(os.path.normpath(rel_dir_path))
-
-        delete_originals_packer(root, originals_to_delete,
-                                list(original_dirs_to_delete))
-
-
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
